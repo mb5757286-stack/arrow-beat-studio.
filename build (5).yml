@@ -1,0 +1,154 @@
+name: Build RPK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '*.zip'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build projects
+        run: |
+          shopt -s nullglob
+          found=0
+          for z in *.zip; do
+            found=1
+            name="${z%.zip}"
+            name="${name// /_}"
+            mkdir -p "out/$name"
+            unzip -o "$z" -d "out/$name"
+            if [ -f "out/$name/src/manifest.json" ]; then
+              (cd "out/$name" && npm install && npx aiot build)
+            elif [ -f "out/$name/index.html" ]; then
+              # zip с сайтом: публикуем как есть на странице /$name/
+              mkdir -p "extra/$name"
+              cp -r "out/$name/." "extra/$name/"
+              rm -rf "out/$name"
+            else
+              echo "Skip $z: no src/manifest.json and no index.html"
+              rm -rf "out/$name"
+            fi
+          done
+          if [ "$found" = 0 ]; then echo "No zip files in repo root"; exit 1; fi
+          find out -name "*.rpk" -not -path "*/node_modules/*" || true
+
+      - name: Upload RPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpk-build
+          path: |
+            out/*/dist/*.rpk
+          if-no-files-found: warn
+
+      - name: Prepare site
+        run: |
+          shopt -s nullglob
+          mkdir -p site/rpk
+          find out -name "*.rpk" -not -path "*/node_modules/*" -exec cp {} site/rpk/ \; 2>/dev/null || true
+          if [ -d extra ]; then cp -r extra/. site/; fi
+          cd site
+          items=""
+          tools=""
+          for d in */; do
+            d="${d%/}"
+            if [ "$d" != "rpk" ] && [ -f "$d/index.html" ]; then
+              tools="$tools<li><span class=\"file\"><b>$d</b><i>сайт</i></span><a class=\"btn\" href=\"$d/\">Открыть</a></li>"
+            fi
+          done
+          for f in rpk/*.rpk; do
+            n=$(basename "$f")
+            sz=$(du -h "$f" | cut -f1)
+            items="$items<li><span class=\"file\"><b>$n</b><i>$sz</i></span><a class=\"btn\" href=\"rpk/$n\" download>Скачать</a></li>"
+          done
+          built=$(date -u +"%d.%m.%Y %H:%M UTC")
+          repo="$GITHUB_REPOSITORY"
+          cat > index.html <<EOF
+          <!doctype html>
+          <html lang="ru">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>RPK Builder</title>
+          <style>
+            :root { color-scheme: dark; }
+            * { box-sizing: border-box; }
+            body { margin: 0; background: #0e0f12; color: #eceef2; font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 32px 16px 64px; }
+            main { max-width: 640px; margin: 0 auto; }
+            h1 { font-size: 32px; line-height: 1.15; margin: 0 0 6px; }
+            h2 { font-size: 20px; margin: 36px 0 12px; }
+            p { color: #9aa1ae; margin: 0 0 16px; }
+            ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+            li { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 14px 16px; background: #16181d; border: 1px solid #272b33; border-radius: 12px; flex-wrap: wrap; }
+            .file { display: grid; min-width: 0; }
+            .file b { font-weight: 500; overflow-wrap: anywhere; }
+            .file i { font-style: normal; color: #9aa1ae; font-size: 14px; }
+            .btn { display: inline-block; padding: 11px 20px; border-radius: 999px; background: #ffb020; color: #1a1200; font-weight: 600; text-decoration: none; }
+            .btn.ghost { background: transparent; color: #eceef2; border: 1px solid #343944; }
+            .row { display: flex; gap: 10px; flex-wrap: wrap; }
+            ol { padding-left: 22px; color: #9aa1ae; }
+            ol li { display: list-item; padding: 0; background: none; border: 0; margin: 6px 0; }
+            small { color: #9aa1ae; }
+          </style>
+          </head>
+          <body>
+          <main>
+            <h1>RPK Builder</h1>
+            <p>Готовые сборки для часов. Последняя сборка: $built</p>
+
+            <h2>Файлы .rpk</h2>
+            <ul>$items</ul>
+
+            <h2>Инструменты</h2>
+            <ul>$tools</ul>
+
+            <h2>Собрать заново</h2>
+            <p>Загрузите zip с проектом в репозиторий. Сборка запустится сама, через пару минут эта страница обновится.</p>
+            <div class="row">
+              <a class="btn" href="https://github.com/$repo/upload/main">Загрузить проект (zip)</a>
+              <a class="btn ghost" href="https://github.com/$repo/actions/workflows/build.yml">Запустить сборку</a>
+            </div>
+
+            <h2>Установка на часы</h2>
+            <ol>
+              <li>Скачайте файл .rpk на телефон.</li>
+              <li>Откройте AstroBox и установите файл на часы.</li>
+            </ol>
+            <small>Неофициальные сборки. Установка на ваш риск.</small>
+          </main>
+          </body>
+          </html>
+          EOF
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
